@@ -171,18 +171,28 @@ error_code sys_event_queue_destroy(ppu_thread& ppu, u32 equeue_id, s32 mode)
 	{
 		std::lock_guard lock(queue->mutex);
 
-		for (auto cpu : queue->sq)
+		if (queue->sq.size())
 		{
 			if (queue->type == SYS_PPU_QUEUE)
 			{
-				static_cast<ppu_thread&>(*cpu).gpr[3] = CELL_ECANCELED;
-				queue->awake(*cpu);
+				std::lock_guard tlock(lv2_obj::g_mutex);
+
+				for (auto cpu : queue->sq)
+				{
+					static_cast<ppu_thread&>(*cpu).gpr[3] = CELL_ECANCELED;
+					queue->append(*cpu);
+				}
+
+				lv2_obj::schedule_all();
 			}
 			else
 			{
-				static_cast<spu_thread&>(*cpu).ch_in_mbox.set_values(1, CELL_ECANCELED);
-				cpu->state += cpu_flag::signal;
-				cpu->notify();
+				for (auto cpu : queue->sq)
+				{
+					static_cast<spu_thread&>(*cpu).ch_in_mbox.set_values(1, CELL_ECANCELED);
+					cpu->state += cpu_flag::signal;
+					cpu->notify();
+				}
 			}
 		}
 	}

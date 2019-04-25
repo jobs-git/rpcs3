@@ -348,10 +348,14 @@ error_code sys_rwlock_wlock(ppu_thread& ppu, u32 rw_lock_id, u64 timeout)
 				{
 					rwlock->owner = (s64{-2} * rwlock->rq.size()) | 1;
 
+					std::lock_guard tlock(lv2_obj::g_mutex);
+
 					while (auto cpu = rwlock->schedule<ppu_thread>(rwlock->rq, SYS_SYNC_PRIORITY))
 					{
-						rwlock->awake(*cpu);
+						rwlock->append(*cpu);
 					}
+
+					lv2_obj::schedule_all();
 
 					rwlock->owner &= ~1;
 				}
@@ -437,9 +441,15 @@ error_code sys_rwlock_wunlock(ppu_thread& ppu, u32 rw_lock_id)
 		{
 			rwlock->owner = (s64{-2} * readers) | 1;
 
-			while (auto cpu = rwlock->schedule<ppu_thread>(rwlock->rq, SYS_SYNC_PRIORITY))
 			{
-				rwlock->awake(*cpu);
+				std::lock_guard tlock(lv2_obj::g_mutex);
+
+				while (auto cpu = rwlock->schedule<ppu_thread>(rwlock->rq, SYS_SYNC_PRIORITY))
+				{
+					rwlock->append(*cpu);
+				}
+
+				lv2_obj::schedule_all();
 			}
 
 			rwlock->owner &= ~1;
