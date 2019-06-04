@@ -1318,7 +1318,7 @@ bool handle_access_violation(u32 addr, bool is_writing, x64_context* context)
 
 			u64 data3;
 			{
-				vm::reader_lock rlock;
+				::reader_lock rlock(vm::g_mutex);
 				if (vm::check_addr(addr, std::max<std::size_t>(1, d_size), vm::page_allocated | (is_writing ? vm::page_writable : vm::page_readable)))
 				{
 					// Memory was allocated inbetween, retry

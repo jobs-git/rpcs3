@@ -119,11 +119,13 @@ using u8  = std::uint8_t;
 using u16 = std::uint16_t;
 using u32 = std::uint32_t;
 using u64 = std::uint64_t;
+using umax_t = std::uintmax_t;
 
 using s8  = std::int8_t;
 using s16 = std::int16_t;
 using s32 = std::int32_t;
 using s64 = std::int64_t;
+using smax_t = std::intmax_t;
 
 using steady_clock = std::conditional<
     std::chrono::high_resolution_clock::is_steady,
@@ -852,4 +854,39 @@ inline void busy_wait(std::size_t cycles = 3000)
 {
 	const u64 s = __rdtsc();
 	do _mm_pause(); while (__rdtsc() - s < cycles);
+}
+
+// Compile time floor log2
+template<umax_t value>
+static inline constexpr u8 flog2()
+{
+	umax_t value_ = value;
+
+	value_ >>= 1;
+
+	for (u8 i = 0;; i++, value_ >>= 1)
+	{
+		if (value_ == 0)
+		{
+			return i;
+		}
+	}
+}
+
+// Compile time ceil log2
+template<umax_t value>
+static inline constexpr u8 clog2()
+{
+	umax_t value_ = value;
+	const umax_t ispow2 = value_ & (value_ - 1); // if power of 2 the result is 0
+
+	value_ >>= 1;
+
+	for (u8 i = 0;; i++, value_ >>= 1)
+	{
+		if (value_ == 0)
+		{
+			return i + static_cast<u8>(std::min<umax_t>(ispow2, 1));
+		}
+	}
 }
