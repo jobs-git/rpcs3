@@ -115,17 +115,15 @@ bool cpu_thread::check_state()
 	}
 #endif
 
-	bool cpu_sleep_called = false;
-	bool cpu_mem_suspend = false;
-
-	while (true)
+	if (((state & cpu_flag::memory_suspend + cpu_flag::memory) == cpu_flag::memory_suspend))
 	{
-		if (((state & cpu_flag::memory_suspend + cpu_flag::memory) == cpu_flag::memory_suspend) && !cpu_mem_suspend)
-		{
-			vm::signal_unlock();
-			cpu_mem_suspend = true;
-		}
+		vm::signal_unlock();
+		state -= cpu_flag::memory_suspend;
+		vm::signal_lock();
+	}
 
+	for (bool cpu_sleep_called = false;;)
+	{
 		if (state & cpu_flag::exit + cpu_flag::jit_return + cpu_flag::dbg_global_stop)
 		{
 			vm::temporary_unlock(*this);
@@ -142,11 +140,6 @@ bool cpu_thread::check_state()
 			if (state & cpu_flag::memory)
 			{
 				cpu_mem();
-			}
-			else if (cpu_mem_suspend)
-			{
-				state -= cpu_flag::memory_suspend;
-				vm::signal_lock();
 			}
 
 			break;

@@ -70,7 +70,7 @@ namespace vm
 			if (!g_locks[i] && g_locks[i].compare_and_swap_test(nullptr, &cpu))
 			{
 				g_tls_locked = g_locks.data() + i;
-				signal_lock(false);
+				signal_lock();
 				return;
 			}
 
@@ -83,33 +83,29 @@ namespace vm
 		}
 	}
 
-	void signal_unlock(bool update_lock)
+	void signal_unlock()
 	{
 		g_putllc_guard.info.unstopped--;
-
-		// This check is a minor optimization for ppu atomics
-		if (update_lock)
-		{
-			// Set "already unlocked" bit
-			g_tls_locked = std::bit_cast<atomic_t<cpu_thread*>*, uptr>((uptr)g_tls_locked | 1);
-		}
 	}
 
-	void signal_lock(bool update_lock)
+	void signal_lock()
 	{
-		if (update_lock)
+		for (;;)
 		{
-			g_tls_locked = std::bit_cast<atomic_t<cpu_thread*>*, uptr>((uptr)g_tls_locked & ~1ull);
-		}
+			if (busy_wait_(8000, []()
+			{
+				if (const u64 state = g_putllc_guard.state; (u32)state == 0 && g_putllc_guard.state.compare_and_swap_test(state, state + (1ull << 32)))
+				{
+					return true;
+				}
 
-		while (true)
-		{
-			if (const u16 state = g_putllc_guard.state; (u8)state == 0 && g_putllc_guard.state.compare_and_swap_test(state, state + 0x100))
+				return false;
+			}))
 			{
 				return;
 			}
 
-			_mm_pause();
+			std::this_thread::yield();
 		}
 	}
 
@@ -119,6 +115,7 @@ namespace vm
 		{
 			*ptr = nullptr;
 			ptr = nullptr;
+			g_putllc_guard.info.unstopped--;
 
 			if (cpu.state & cpu_flag::memory)
 			{
@@ -143,13 +140,9 @@ namespace vm
 	{
 		if (auto& lock = g_tls_locked)
 		{
-			if (!((uptr)lock & 1))
-			{
-				g_putllc_guard.info.unstopped--;
-			}
-
+			g_putllc_guard.info.unstopped--;
+			*lock = nullptr;
 			cpu.cpu_unmem();
-			*std::bit_cast<atomic_t<cpu_thread*>*, uptr>((uptr)lock & ~1ull) = nullptr;
 			lock = nullptr;
 		}
 	}

@@ -2,6 +2,7 @@
 
 #include "types.h"
 #include <functional>
+#include <atomic>
 
 // Helper class, provides access to compiler-specific atomic intrinsics
 template <typename T, std::size_t Size = sizeof(T)>

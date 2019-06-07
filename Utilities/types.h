@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #ifdef _MSC_VER
 #include <intrin.h>
@@ -854,6 +854,19 @@ inline void busy_wait(std::size_t cycles = 3000)
 {
 	const u64 s = __rdtsc();
 	do _mm_pause(); while (__rdtsc() - s < cycles);
+}
+
+// busy waiting with (shortly evaluated)condition passed
+template<typename F>
+inline bool busy_wait_(std::size_t cycles, F&& func)
+{
+	const u64 s = __rdtsc();
+	do
+	{
+	if (func()) return true;
+	_mm_pause();
+	} while (__rdtsc() - s < cycles);
+	return false;
 }
 
 // Compile time floor log2

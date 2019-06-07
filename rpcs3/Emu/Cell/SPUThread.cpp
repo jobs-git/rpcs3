@@ -29,13 +29,14 @@ namespace vm
 };
 
 putllc_guard g_putllc_guard = {};
-atomic_t<u64> g_putllc_dma_guard[0x100000000 / (64 * 128)] = {};
+std::array<atomic_t<u64>, 6> g_range_locks = {};
 
 // Barrier for ppu execution (used by atomic commands)
 struct putllc_begin
 {
 	static void begin(const u32 addr)
 	{
+		/*
 		// Lock DMA slot, this meant to protect from large PUT transfers
 		while (atomic_storage<u8>::bts(((u8*)&g_putllc_dma_guard)[addr / (8 * 128) ^ (IS_BE_MACHINE * 7)], (addr / 128) % 8))
 		{
@@ -73,38 +74,63 @@ struct putllc_begin
 				i = 0;
 			}
 		}
+		*/
 	}
 
 	static void end(const u32 addr)
 	{
+		/*
 		g_putllc_guard.info.executers--;
 
 		atomic_storage<u8>::bts(((u8*)&g_putllc_dma_guard)[addr / (8 * 128) ^ (IS_BE_MACHINE * 7)], (addr / 128) % 8);
+		*/
 	}
 };
 
-static std::pair<atomic_t<u64>*, u64> range_lock(const u64 addr, const u64 count)
+static atomic_t<u64>* passive_lock(const u64 lock_info)
 {
-	// Get lock range
-	const u64 range = count == 64 ? -1ull :
-	((1ull << count) - 1ull) << ((addr / 128) % 64);
-	atomic_t<u64>& slot = g_putllc_dma_guard[addr / (64 * 128)];
-
-	while (!slot.cond_op([&](u64& value)
+	while (true)
 	{
-		if (value & range)
+		for (auto& lock : g_range_locks)
 		{
-			return false;
+			if (!lock && lock.compare_and_swap_test(0, lock_info))
+			{
+				return &lock;
+			}
+		}
+	}
+}
+
+static atomic_t<u64>* range_lock(const u32 addr, const u32 end)
+{
+	static const auto test_addr = [](const u32 target, const u32 addr, const u32 end)
+	{
+		return addr > target || end <= target;
+	};
+
+	for (;;)
+	{
+		if (LIKELY(test_addr(g_putllc_guard.info.executer.load(), addr, end)))
+		{
+			atomic_t<u64>* _ret = passive_lock((u64)addr << 32 | end);
+
+			if (LIKELY(test_addr(g_putllc_guard.info.executer.load(), addr, end)))
+			{
+				return _ret;
+			}
+
+			*_ret = 0; 
 		}
 
-		value |= range;
-		return true;
-	}))
-	{
-		_mm_pause();
+		if (g_putllc_guard.info.unstopped)
+		{
+			std::this_thread::yield();
+		}
+		else
+		{
+			busy_wait(200);
+		}
 	}
-
-	return {&slot, range};
 }
 
 // Verify AVX availability for TSX transactions
@@ -1116,10 +1142,14 @@ const auto spu_putllc_raw = build_function_asm<u32(*)(u32 raddr, u64 rtime, cons
 	const auto& to_write = x86::rbx; //args[3];
 
 	Label rtime_no_waiting = c.newLabel();
-	Label fail = c.newLabel(); // Failed on rdata
-	Label fail_rtime = c.newLabel(); // Failed on rtime
-	Label lock_dma = c.newLabel();
-	Label wait_dma = c.newLabel();
+	Label wait_executer = c.newLabel();
+	Label wait_rtime = c.newLabel();
+	Label prolouge = c.newLabel();
+	Label yield = c.newLabel();
+	Label null_ppu = c.newLabel();
+	Label begin_r = c.newLabel();
+	Label fail_rtime = c.newLabel();
+	Label fail_rdata = c.newLabel();
 
 #ifndef _WIN32 
 	c.push(x86::rbp); // ???
@@ -1161,133 +1191,24 @@ const auto spu_putllc_raw = build_function_asm<u32(*)(u32 raddr, u64 rtime, cons
 
 	c.mov(x86::rax, imm_ptr(&vm::g_base_addr));
 	c.mov(x86::rax, x86::qword_ptr(x86::rax));
-	c.lea(paddr, x86::ptr(x86::rax, raddr));
+	c.lea(paddr, x86::qword_ptr(x86::rax, raddr));
 	c.mov(x86::rax, imm_ptr(&vm::g_reservations));
 	c.mov(x86::rax, x86::qword_ptr(x86::rax));
 	c.shr(raddr.r32(), 7 - 3); // sizeof(cache line) / sizeof(reservation)
-	c.lea(ptime, x86::ptr(x86::rax, raddr));
+	c.lea(ptime, x86::qword_ptr(x86::rax, raddr));
+	c.xor_(x86::eax, x86::eax);
 
-	c.lock().bts(x86::qword_ptr(ptime), 0);
-	c.jnc(rtime_no_waiting);
-	c.mov(args[0], ptime);
-	c.call(imm_ptr(&vm::reservation_lock_internal));
-	c.bind(rtime_no_waiting);
-
-	c.or_(rtime, 0x1); // Match the lock bit
-	c.cmp(rtime, x86::qword_ptr(ptime));
-	c.jne(fail_rtime);
-
-	// Load rdata (we don't need 'rdata' reg's content afterwards)
+	// Load and test rdata
 	if (utils::has_avx())
 	{
 		c.vmovups(x86::ymm0, x86::yword_ptr(rdata, 0));
 		c.vmovups(x86::ymm1, x86::yword_ptr(rdata, 32));
 		c.vmovups(x86::ymm2, x86::yword_ptr(rdata, 64));
 		c.vmovups(x86::ymm3, x86::yword_ptr(rdata, 96));
-	}
-	else
-	{
-		c.movaps(x86::xmm0, x86::oword_ptr(rdata, 0));
-		c.movaps(x86::xmm1, x86::oword_ptr(rdata, 16));
-		c.movaps(x86::xmm2, x86::oword_ptr(rdata, 32));
-		c.movaps(x86::xmm3, x86::oword_ptr(rdata, 48));
-		c.movaps(x86::xmm4, x86::oword_ptr(rdata, 64));
-		c.movaps(x86::xmm5, x86::oword_ptr(rdata, 80));
-		c.movaps(x86::xmm6, x86::oword_ptr(rdata, 96));
-		c.movaps(x86::xmm7, x86::oword_ptr(rdata, 112));
-	}
-
-	c.bind(lock_dma);
-	c.mov(args[0].r32(), paddr.r32()); // Extract addr
-	c.shr(args[0].r32(), ::flog2<(32 * 128)>());
-	c.mov(x86::rax, imm_ptr(&g_putllc_dma_guard));
-	c.lea(x86::rax, x86::ptr(x86::rax, args[0], ::flog2<sizeof(u32)>()));
-	c.mov(args[0].r32(), paddr.r32());
-	c.shr(args[0].r32(), 7);
-	c.and_(args[0].r32(), 32 - 1);
-	c.lock().bts(x86::dword_ptr(x86::rax), args[0].r32());
-	c.jc(wait_dma);
-
-	Label critical_section = c.newLabel();
-	Label init_towrite = c.newLabel();
-	Label wait_unstopped = c.newLabel();
-
-	// Reassign registers
-	const auto& guard = x86::r15; // global PUTLLC's guard
-	const u64 exec_offs = std::bit_cast<u64>(&g_putllc_guard.info.executers.raw()) - std::bit_cast<u64>(&g_putllc_guard.state.raw());
-	const u64 unstop_offs = std::bit_cast<u64>(&g_putllc_guard.info.unstopped.raw()) - std::bit_cast<u64>(&g_putllc_guard.state.raw());
-
-	c.mov(guard, imm_ptr(&g_putllc_guard.state.raw()));
-	c.mov(args[0].r32(), 1);
-	c.lock().xadd(x86::word_ptr(guard), args[0].r16()); // Increment executers count
-	c.test(args[0].r8(), 0x7F);
-	c.jne(init_towrite); // Branch if multiple executers
-
-	Label signal_ppus = c.newLabel();
-	Label signal_ppu = c.newLabel();
-
-	c.mov(x86::rcx, imm_ptr(&g_cfg.core.ppu_threads.get()));
-	c.mov(x86::ecx, x86::dword_ptr(x86::rcx));
-	c.mov(args[1].r32(), x86::ecx); // simple copy
-
-	// Try loop instruction (can fail if too far)
-	const auto try_loop = [](X86Assembler& c, Label& label)
-	{
-		if (c.getLastError() == ErrorCode::kErrorOk
-			&& c.loop(label) != ErrorCode::kErrorOk)
-		{
-			c.resetLastError();
-			c.dec(x86::ecx);
-			c.jne(label);
-		}
-	};
-
-	c.bind(signal_ppus);
-	c.mov(x86::rax, imm_ptr(vm::g_locks.data() - 1));
-
-	static_assert(sizeof(atomic_t<cpu_thread*>) == sizeof(uptr) && sizeof(atomic_bs_t<cpu_flag>) == sizeof(u32));
-	c.bind(signal_ppu);
-
-	Label null_ppu = c.newLabel(); 
-	c.mov(args[2], x86::qword_ptr(x86::rax, x86::rcx, ::flog2<sizeof(uptr)>()));
-	c.test(args[2], args[2]);
-	c.je(null_ppu);
-	c.lock().or_(x86::dword_ptr(args[2], ::offset32(&cpu_thread::state)), 1u << (u32)cpu_flag::memory_suspend);
-	c.bind(null_ppu);
-	try_loop(c, signal_ppu);
-
-	// We have some time, load to_write (we don't need 'to_write' reg's content afterwards)
-	if (utils::has_avx())
-	{
-		c.vmovaps(x86::ymm4, x86::yword_ptr(to_write, 0));
-		c.vmovaps(x86::ymm5, x86::yword_ptr(to_write, 32));
-		c.vmovaps(x86::ymm6, x86::yword_ptr(to_write, 64));
-		c.vmovaps(x86::ymm7, x86::yword_ptr(to_write, 96));
-	}
-	else
-	{
-		c.movaps(x86::xmm8, x86::oword_ptr(to_write, 0));
-		c.movaps(x86::xmm9, x86::oword_ptr(to_write, 16));
-		c.movaps(x86::xmm10, x86::oword_ptr(to_write, 32));
-		c.movaps(x86::xmm11, x86::oword_ptr(to_write, 48));
-		c.movaps(x86::xmm12, x86::oword_ptr(to_write, 64));
-		c.movaps(x86::xmm13, x86::oword_ptr(to_write, 80));
-		c.movaps(x86::xmm14, x86::oword_ptr(to_write, 96));
-		c.movaps(x86::xmm15, x86::oword_ptr(to_write, 112));
-	}
-
-	c.mov(x86::ecx, 30); // This number may be adjusted according to cpu in the future
-	c.bind(wait_unstopped);
-	c.test(x86::byte_ptr(guard, unstop_offs), 0x7f); // Test unstopped
-	c.je(critical_section);
-	try_loop(c, wait_unstopped);
-	c.mov(x86::ecx, args[1].r32()); // Restore max ppu threads 
-	c.jmp(signal_ppus);
-
-	c.bind(critical_section);
-
-	if (utils::has_avx())
-	{
+		c.vmovaps(x86::ymm4, x86::ymm0);
+		c.vmovaps(x86::ymm5, x86::ymm1);
+		c.vmovaps(x86::ymm6, x86::ymm2);
+		c.vmovaps(x86::ymm7, x86::ymm3);
 		c.vxorps(x86::ymm0, x86::ymm0, x86::yword_ptr(paddr, 0));
 		c.vxorps(x86::ymm1, x86::ymm1, x86::yword_ptr(paddr, 32));
 		c.vxorps(x86::ymm2, x86::ymm2, x86::yword_ptr(paddr, 64));
@@ -1299,6 +1220,22 @@ const auto spu_putllc_raw = build_function_asm<u32(*)(u32 raddr, u64 rtime, cons
 	}
 	else
 	{
+		c.movaps(x86::xmm0, x86::oword_ptr(rdata, 0));
+		c.movaps(x86::xmm1, x86::oword_ptr(rdata, 16));
+		c.movaps(x86::xmm2, x86::oword_ptr(rdata, 32));
+		c.movaps(x86::xmm3, x86::oword_ptr(rdata, 48));
+		c.movaps(x86::xmm4, x86::oword_ptr(rdata, 64));
+		c.movaps(x86::xmm5, x86::oword_ptr(rdata, 80));
+		c.movaps(x86::xmm6, x86::oword_ptr(rdata, 96));
+		c.movaps(x86::xmm7, x86::oword_ptr(rdata, 112));
+		c.movaps(x86::xmm8, x86::xmm0);
+		c.movaps(x86::xmm9, x86::xmm1);
+		c.movaps(x86::xmm10, x86::xmm2);
+		c.movaps(x86::xmm11, x86::xmm3);
+		c.movaps(x86::xmm12, x86::xmm4);
+		c.movaps(x86::xmm13, x86::xmm5);
+		c.movaps(x86::xmm14, x86::xmm6);
+		c.movaps(x86::xmm15, x86::xmm7);
 		c.xorps(x86::xmm0, x86::oword_ptr(paddr, 0));
 		c.xorps(x86::xmm1, x86::oword_ptr(paddr, 16));
 		c.xorps(x86::xmm2, x86::oword_ptr(paddr, 32));
@@ -1327,61 +1264,185 @@ const auto spu_putllc_raw = build_function_asm<u32(*)(u32 raddr, u64 rtime, cons
 		}
 	}
 
-	c.jne(fail);
+	c.jne(prolouge);
 
+	// Load to_write
 	if (utils::has_avx())
 	{
-		c.vmovaps(x86::yword_ptr(paddr, 0), x86::ymm4);
-		c.vmovaps(x86::yword_ptr(paddr, 32), x86::ymm5);
-		c.vmovaps(x86::yword_ptr(paddr, 64), x86::ymm6);
-		c.vmovaps(x86::yword_ptr(paddr, 96), x86::ymm7);
+		c.vmovaps(x86::ymm0, x86::yword_ptr(to_write, 0));
+		c.vmovaps(x86::ymm1, x86::yword_ptr(to_write, 32));
+		c.vmovaps(x86::ymm2, x86::yword_ptr(to_write, 64));
+		c.vmovaps(x86::ymm3, x86::yword_ptr(to_write, 96));
 	}
 	else
 	{
-		c.movaps(x86::oword_ptr(paddr, 0), x86::xmm7);
-		c.movaps(x86::oword_ptr(paddr, 16), x86::xmm8);
-		c.movaps(x86::oword_ptr(paddr, 32), x86::xmm9);
-		c.movaps(x86::oword_ptr(paddr, 48), x86::xmm10);
-		c.movaps(x86::oword_ptr(paddr, 64), x86::xmm11);
-		c.movaps(x86::oword_ptr(paddr, 80), x86::xmm12);
-		c.movaps(x86::oword_ptr(paddr, 96), x86::xmm13);
-		c.movaps(x86::oword_ptr(paddr, 112), x86::xmm14);
+		c.movaps(x86::xmm0, x86::oword_ptr(to_write, 0));
+		c.movaps(x86::xmm1, x86::oword_ptr(to_write, 16));
+		c.movaps(x86::xmm2, x86::oword_ptr(to_write, 32));
+		c.movaps(x86::xmm3, x86::oword_ptr(to_write, 48));
+		c.movaps(x86::xmm4, x86::oword_ptr(to_write, 64));
+		c.movaps(x86::xmm5, x86::oword_ptr(to_write, 80));
+		c.movaps(x86::xmm6, x86::oword_ptr(to_write, 96));
+		c.movaps(x86::xmm7, x86::oword_ptr(to_write, 112));
 	}
 
-	c.lea(rtime, x86::ptr(rtime, 127));
+	c.bind(begin_r);
+	c.lock().bts(x86::qword_ptr(ptime), 0);
+	c.jc(wait_rtime);
+
+	c.or_(rtime, 0x1); // Match the lock bit
+	c.cmp(rtime, x86::qword_ptr(ptime));
+	c.jne(fail_rtime);
+
+	Label critical_section = c.newLabel();
+
+	// Reassign registers
+	const auto& guard = x86::r15; // global PUTLLC's guard
+
+	c.mov(guard, imm_ptr(&g_putllc_guard.state.raw()));
+	c.xor_(x86::eax, x86::eax);
+	c.lock().cmpxchg(x86::dword_ptr(guard), paddr.r32()); // Lock addr
+	c.jne(wait_executer); // Branch if multiple executers
+
+	c.mov(x86::rcx, imm_ptr(&g_cfg.core.ppu_threads.get()));
+	c.mov(x86::ecx, x86::dword_ptr(x86::rcx));
+	c.mov(args[1].r32(), x86::ecx); // simple copy
+
+	// Try loop instruction (can fail if too far)
+	const auto try_loop = [&](Label& label)
+	{
+		if (c.getLastError() == ErrorCode::kErrorOk
+			&& c.loop(label) != ErrorCode::kErrorOk)
+		{
+			c.resetLastError();
+			c.dec(x86::ecx);
+			c.jne(label);
+		}
+	};
+
+
+	Label signal_ppu = c.newLabel();
+	c.mov(x86::rax, imm_ptr(vm::g_locks.data() - 1));
+
+	static_assert(sizeof(atomic_t<cpu_thread*>) == sizeof(uptr) && sizeof(atomic_bs_t<cpu_flag>) == sizeof(u32));
+	c.bind(signal_ppu);
+
+	c.mov(args[2], x86::qword_ptr(x86::rax, x86::rcx, flog2<sizeof(uptr)>(), 0));
+	c.test(args[2], args[2]);
+	c.je(null_ppu);
+	c.lock().or_(x86::dword_ptr(args[2], ::offset32(&cpu_thread::state)), 1u << (u32)cpu_flag::memory_suspend);
+	c.bind(null_ppu);
+	try_loop(signal_ppu);
+
+	c.mov(x86::rax, imm_ptr(g_range_locks.data() - 1));
+	c.mov(x86::ecx, g_range_locks.size());
+
+	// Go through range locks (TODO: Fallback to yield when needed)
+	{
+		Label loop_here = c.newLabel();
+		Label next = c.newLabel();
+		c.bind(loop_here);
+
+		c.mov(args[1], x86::qword_ptr(x86::rax, x86::rcx, flog2<sizeof(u64)>(), 0));
+		c.cmp(args[1].r32(), paddr.r32());
+		c.jae(next);
+		c.shr(args[1], 32);
+		c.cmp(args[1].r32(), paddr.r32());
+		c.jae(loop_here);
+		c.bind(next);
+		try_loop(loop_here);
+	}
+
+	{
+		Label wait_uns = c.newLabel();
+		c.bind(wait_uns);
+		c.cmp(x86::dword_ptr(guard, ::offset32(&decltype(putllc_guard::info)::unstopped)), 0); // Test unstopped
+		c.je(critical_section);
+		c.pause();
+		c.jmp(wait_uns);
+	}
+
+	c.bind(critical_section);
+
+	if (utils::has_avx())
+	{
+		c.vxorps(x86::ymm4, x86::ymm4, x86::yword_ptr(paddr, 0));
+		c.vxorps(x86::ymm5, x86::ymm5, x86::yword_ptr(paddr, 32));
+		c.vxorps(x86::ymm6, x86::ymm6, x86::yword_ptr(paddr, 64));
+		c.vxorps(x86::ymm7, x86::ymm7, x86::yword_ptr(paddr, 96));
+		c.vorps(x86::ymm4, x86::ymm4, x86::ymm5);
+		c.vorps(x86::ymm5, x86::ymm6, x86::ymm7);
+		c.vorps(x86::ymm4, x86::ymm5, x86::ymm4);
+		c.vptest(x86::ymm4, x86::ymm4);
+	}
+	else
+	{
+		c.xorps(x86::xmm8, x86::oword_ptr(paddr, 0));
+		c.xorps(x86::xmm9, x86::oword_ptr(paddr, 16));
+		c.xorps(x86::xmm10, x86::oword_ptr(paddr, 32));
+		c.xorps(x86::xmm11, x86::oword_ptr(paddr, 48));
+		c.xorps(x86::xmm12, x86::oword_ptr(paddr, 64));
+		c.xorps(x86::xmm13, x86::oword_ptr(paddr, 80));
+		c.xorps(x86::xmm14, x86::oword_ptr(paddr, 96));
+		c.xorps(x86::xmm15, x86::oword_ptr(paddr, 112));
+		c.orps(x86::xmm8, x86::xmm9);
+		c.orps(x86::xmm10, x86::xmm11);
+		c.orps(x86::xmm12, x86::xmm13);
+		c.orps(x86::xmm14, x86::xmm15);
+		c.orps(x86::xmm8, x86::xmm10);
+		c.orps(x86::xmm12, x86::xmm14);
+		c.orps(x86::xmm8, x86::xmm12);
+	
+		if (utils::has_sse41())
+		{
+			c.ptest(x86::xmm0, x86::xmm0);
+		}
+		else
+		{
+			c.packssdw(x86::xmm0, x86::xmm0);
+			c.movq(x86::rax, x86::xmm0);
+			c.test(x86::rax, x86::rax);
+		}
+	}
+
+	c.jne(fail_rdata);
+
+	if (utils::has_avx())
+	{
+		c.vmovaps(x86::yword_ptr(paddr, 0), x86::ymm0);
+		c.vmovaps(x86::yword_ptr(paddr, 32), x86::ymm1);
+		c.vmovaps(x86::yword_ptr(paddr, 64), x86::ymm2);
+		c.vmovaps(x86::yword_ptr(paddr, 96), x86::ymm3);
+	}
+	else
+	{
+		c.movaps(x86::oword_ptr(paddr, 0), x86::xmm0);
+		c.movaps(x86::oword_ptr(paddr, 16), x86::xmm1);
+		c.movaps(x86::oword_ptr(paddr, 32), x86::xmm2);
+		c.movaps(x86::oword_ptr(paddr, 48), x86::xmm3);
+		c.movaps(x86::oword_ptr(paddr, 64), x86::xmm4);
+		c.movaps(x86::oword_ptr(paddr, 80), x86::xmm5);
+		c.movaps(x86::oword_ptr(paddr, 96), x86::xmm6);
+		c.movaps(x86::oword_ptr(paddr, 112), x86::xmm7);
+	}
+
+	c.lea(rtime, x86::qword_ptr(rtime, 127));
 	c.mov(x86::qword_ptr(ptime), rtime);
 
-	Label prolouge = c.newLabel();
-	Label finish = c.newLabel();
-
 	// Success!
-	c.lock().sub(x86::byte_ptr(guard, exec_offs), 1); // Decrease executers count
+	c.xor_(x86::eax, x86::eax);
+	c.xchg(x86::dword_ptr(guard), x86::eax);
 	c.mov(x86::eax, 1);
-	c.jmp(finish);
+	c.jmp(prolouge);
 
 	// Failure
+	c.bind(fail_rdata);
+	c.xor_(x86::eax, x86::eax);
+	c.xchg(x86::dword_ptr(guard), x86::eax);
 	c.bind(fail_rtime);
 	c.sub(x86::qword_ptr(ptime), 1);
 	c.xor_(x86::eax, x86::eax);
-	c.jmp(prolouge);
-	c.bind(fail);
-	c.lock().sub(x86::byte_ptr(guard, exec_offs), 1);
-	c.dec(rtime);
-	c.mov(x86::qword_ptr(ptime), rtime);
-	c.xor_(x86::eax, x86::eax);
 
-	c.bind(finish);
-	c.mov(x86::ecx, paddr.r32()); // Extract addr
-	c.shr(x86::ecx, ::flog2<(8 * 128)>());
-	c.mov(x86::r14, imm_ptr(&g_putllc_dma_guard));
-	c.lea(x86::r14, x86::ptr(x86::r14, x86::rcx));
-	c.mov(x86::ecx, paddr.r32());
-	c.shr(x86::ecx, 7);
-	c.and_(x86::ecx, 8 - 1);
-	c.mov(x86::r15b, 1);
-	c.shl(x86::r15b, x86::cl);
-	c.not_(x86::r15b);
-	c.lock().and_(x86::byte_ptr(x86::r14), x86::r15b);
 	c.bind(prolouge);
 
 	if (utils::has_avx())
@@ -1426,40 +1487,81 @@ const auto spu_putllc_raw = build_function_asm<u32(*)(u32 raddr, u64 rtime, cons
 	c.ret();
 
 	c.align(kAlignCode, 16);
-	c.bind(wait_dma);
-	c.pause();
-	c.jmp(lock_dma);
+	c.bind(wait_executer);
 
-	// Load to_write
+	c.lea(args[0], x86::qword_ptr(rtime, -1));
+	c.mov(x86::qword_ptr(ptime), args[0]); // Unlock rtime
+
+	const auto _busy_wait = [&](s32 cycles, const std::function<void()>& condition)
+	{
+		Label start_clock = c.newLabel();
+		c.rdtsc();
+		c.shl(x86::rdx, 32);
+		c.or_(x86::rax, x86::rdx);
+		c.mov(x86::rcx, x86::rax);
+		c.bind(start_clock);
+		condition();
+		c.pause();
+		c.rdtsc();
+		c.shl(x86::rdx, 32);
+		c.or_(x86::rax, x86::rdx);
+		c.lea(x86::rax, x86::qword_ptr(x86::rax, -cycles));
+		c.cmp(x86::rax, x86::rcx);
+		c.jl(start_clock);
+	};
+
+	_busy_wait(8000, [&]()
+	{
+		c.cmp(x86::dword_ptr(guard), 0);
+		c.je(begin_r);
+	});
+
+	c.jmp(yield);
 	c.align(kAlignCode, 16);
-	c.bind(init_towrite);
+	c.bind(wait_rtime);
 
-	// Load to_write
+	_busy_wait(8000, [&]()
+	{
+		c.test(x86::byte_ptr(ptime), 1);
+		c.je(begin_r);
+	});
+
+	c.bind(yield);
+	c.call(imm_ptr(&std::this_thread::yield));
+
+	// Reinitialize
 	if (utils::has_avx())
 	{
-		c.vmovaps(x86::ymm4, x86::yword_ptr(to_write, 0));
-		c.vmovaps(x86::ymm5, x86::yword_ptr(to_write, 32));
-		c.vmovaps(x86::ymm6, x86::yword_ptr(to_write, 64));
-		c.vmovaps(x86::ymm7, x86::yword_ptr(to_write, 96));
+		c.vmovaps(x86::ymm0, x86::yword_ptr(to_write, 0));
+		c.vmovaps(x86::ymm1, x86::yword_ptr(to_write, 32));
+		c.vmovaps(x86::ymm2, x86::yword_ptr(to_write, 64));
+		c.vmovaps(x86::ymm3, x86::yword_ptr(to_write, 96));
+		c.vmovups(x86::ymm4, x86::yword_ptr(rdata, 0));
+		c.vmovups(x86::ymm5, x86::yword_ptr(rdata, 32));
+		c.vmovups(x86::ymm6, x86::yword_ptr(rdata, 64));
+		c.vmovups(x86::ymm7, x86::yword_ptr(rdata, 96));
 	}
 	else
 	{
-		c.movaps(x86::xmm8, x86::oword_ptr(to_write, 0));
-		c.movaps(x86::xmm9, x86::oword_ptr(to_write, 16));
-		c.movaps(x86::xmm10, x86::oword_ptr(to_write, 32));
-		c.movaps(x86::xmm11, x86::oword_ptr(to_write, 48));
-		c.movaps(x86::xmm12, x86::oword_ptr(to_write, 64));
-		c.movaps(x86::xmm13, x86::oword_ptr(to_write, 80));
-		c.movaps(x86::xmm14, x86::oword_ptr(to_write, 96));
-		c.movaps(x86::xmm15, x86::oword_ptr(to_write, 112));
+		c.movaps(x86::xmm0, x86::oword_ptr(to_write, 0));
+		c.movaps(x86::xmm1, x86::oword_ptr(to_write, 16));
+		c.movaps(x86::xmm2, x86::oword_ptr(to_write, 32));
+		c.movaps(x86::xmm3, x86::oword_ptr(to_write, 48));
+		c.movaps(x86::xmm4, x86::oword_ptr(to_write, 64));
+		c.movaps(x86::xmm5, x86::oword_ptr(to_write, 80));
+		c.movaps(x86::xmm6, x86::oword_ptr(to_write, 96));
+		c.movaps(x86::xmm7, x86::oword_ptr(to_write, 112));
+		c.movaps(x86::xmm8, x86::oword_ptr(rdata, 0));
+		c.movaps(x86::xmm9, x86::oword_ptr(rdata, 16));
+		c.movaps(x86::xmm10, x86::oword_ptr(rdata, 32));
+		c.movaps(x86::xmm11, x86::oword_ptr(rdata, 48));
+		c.movaps(x86::xmm12, x86::oword_ptr(rdata, 64));
+		c.movaps(x86::xmm13, x86::oword_ptr(rdata, 80));
+		c.movaps(x86::xmm14, x86::oword_ptr(rdata, 96));
+		c.movaps(x86::xmm15, x86::oword_ptr(rdata, 112));
 	}
 
-	c.test(args[0].r16(), 0xFF00);
-	c.je(critical_section); // This is our lucky day! all ppu threads have stopped already
-	c.mov(args[1], imm_ptr(&g_cfg.core.ppu_threads.get()));
-	c.mov(args[1].r32(), x86::dword_ptr(args[1].r32())); // Set max
-	c.mov(x86::ecx, 30); // Set loop count
-	c.jmp(wait_unstopped);
+	c.jmp(begin_r);
 });
 
 void spu_int_ctrl_t::set(u64 ints)
@@ -1820,8 +1922,8 @@ void spu_thread::do_dma_transfer(const spu_mfc_cmd& args)
 {
 	const bool is_get = (args.cmd & ~(MFC_BARRIER_MASK | MFC_FENCE_MASK | MFC_START_MASK)) == MFC_GET_CMD;
 
-	uptr eal = args.eal;
-	uptr lsa = args.lsa & 0x3ffff;
+	u32 eal = args.eal;
+	u32 lsa = args.lsa & 0x3ffff;
 
 	// SPU Thread Group MMIO (LS and SNR) and RawSPU MMIO
 	if (eal >= RAW_SPU_BASE_ADDR)
@@ -1940,39 +2042,27 @@ void spu_thread::do_dma_transfer(const spu_mfc_cmd& args)
 				break;
 			}
 
-			while (size > 0)
+			const auto lock = ::range_lock(eal, ::align(size + eal, 128));
+
+			while (size >= 128)
 			{
-				u32 _size = size;
+				mov_rdata(reinterpret_cast<u128*>(dst), reinterpret_cast<const u128*>(src));
 
-				if (const u32 area = (size + (eal % (128 * 64))) - (128 * 64); (s32)area > 0)
-				{
-					_size -= area;
-				}
-
-				size -= _size;
-
-				const auto [lock, range] = ::range_lock(eal, ::align(_size + (eal & 127), 128) / 128);
-
-				while (_size >= 128)
-				{
-					mov_rdata(reinterpret_cast<u128*>(dst), reinterpret_cast<const u128*>(src));
-
-					dst += 128;
-					src += 128;
-					_size -= 128;
-				}
-
-				while (_size)
-				{
-					*reinterpret_cast<u128*>(dst) = *reinterpret_cast<const u128*>(src);
-
-					dst += 16;
-					src += 16;
-					_size -= 16;
-				}
-
-				*lock &= ~range;
+				dst += 128;
+				src += 128;
+				size -= 128;
 			}
+
+			while (size)
+			{
+				*reinterpret_cast<u128*>(dst) = *reinterpret_cast<const u128*>(src);
+
+				dst += 16;
+				src += 16;
+				size -= 16;
+			}
+
+			lock->release(0);
 
 			break;
 		}

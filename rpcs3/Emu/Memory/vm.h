@@ -59,8 +59,8 @@ namespace vm
 	// Unregister reader
 	void passive_unlock(cpu_thread& cpu);
 
-	void signal_unlock(bool = true);
-	void signal_lock(bool = true);
+	void signal_unlock();
+	void signal_lock();
 
 	// Unregister reader (foreign thread)
 	void cleanup_unlock(cpu_thread& cpu) noexcept;

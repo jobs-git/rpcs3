@@ -17,7 +17,7 @@ void _sys_ppu_thread_exit(ppu_thread& ppu, u64 errorcode)
 	vm::temporary_unlock(ppu);
 
 	// Wait until all current putllc executers finish before deleting the thread
-	while (g_putllc_guard.info.executers) _mm_pause();
+	while (g_putllc_guard.info.executer) _mm_pause();
 
 	sys_ppu_thread.trace("_sys_ppu_thread_exit(errorcode=0x%llx)", errorcode);
 
