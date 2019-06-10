@@ -300,6 +300,8 @@ error_code sys_event_flag_set(u32 id, u64 bitptn)
 			return CELL_OK;
 		}
 
+		std::lock_guard tlock(lv2_obj::g_mutex);
+
 		// Remove waiters
 		const auto tail = std::remove_if(flag->sq.begin(), flag->sq.end(), [&](cpu_thread* cpu)
 		{
@@ -308,7 +310,7 @@ error_code sys_event_flag_set(u32 id, u64 bitptn)
 			if (ppu.gpr[3] == CELL_OK)
 			{
 				flag->waiters--;
-				flag->awake(ppu);
+				flag->append(ppu);
 				return true;
 			}
 
@@ -316,6 +318,7 @@ error_code sys_event_flag_set(u32 id, u64 bitptn)
 		});
 
 		flag->sq.erase(tail, flag->sq.end());
+		lv2_obj::schedule_all();
 	}
 
 	return CELL_OK;
@@ -361,6 +364,8 @@ error_code sys_event_flag_cancel(ppu_thread& ppu, u32 id, vm::ptr<u32> num)
 		// Set count
 		value = ::size32(flag->sq);
 
+		std::lock_guard tlock(lv2_obj::g_mutex);
+
 		// Signal all threads to return CELL_ECANCELED
 		while (auto thread = flag->schedule<ppu_thread>(flag->sq, flag->protocol))
 		{
@@ -370,8 +375,10 @@ error_code sys_event_flag_cancel(ppu_thread& ppu, u32 id, vm::ptr<u32> num)
 			ppu.gpr[6] = pattern;
 
 			flag->waiters--;
-			flag->awake(ppu);
+			flag->append(ppu);
 		}
+
+		lv2_obj::schedule_all();
 	}
 
 	if (ppu.test_stopped())

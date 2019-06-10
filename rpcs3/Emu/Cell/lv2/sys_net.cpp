@@ -207,7 +207,17 @@ extern void network_thread_init()
 			for (ppu_thread* ppu : s_to_awake)
 			{
 				network_clear_queue(*ppu);
-				lv2_obj::awake(*ppu);
+			}
+
+			{
+				std::lock_guard tlock(lv2_obj::g_mutex);
+
+				for (ppu_thread* ppu : s_to_awake)
+				{
+					lv2_obj::append(*ppu);
+				}
+
+				lv2_obj::schedule_all();
 			}
 
 			s_to_awake.clear();

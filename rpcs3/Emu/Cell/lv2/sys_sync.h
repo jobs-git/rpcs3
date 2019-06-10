@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #include "Utilities/mutex.h"
 #include "Utilities/sema.h"
@@ -114,12 +114,15 @@ struct lv2_obj
 	}
 
 	// Remove the current thread from the scheduling queue, register timeout
-	static void sleep_timeout(cpu_thread&, u64 timeout);
+	static void sleep_unlocked(cpu_thread&, u64 timeout);
 
-	static void sleep(cpu_thread& thread, u64 timeout = 0)
+	static void sleep(cpu_thread& cpu, u64 timeout = 0)
 	{
-		vm::temporary_unlock(thread);
-		sleep_timeout(thread, timeout);
+		vm::temporary_unlock(cpu);
+
+		std::lock_guard lock(g_mutex);
+
+		sleep_unlocked(cpu, timeout);
 	}
 
 	static void yield(cpu_thread& thread)
@@ -129,12 +132,26 @@ struct lv2_obj
 	}
 
 	// Schedule the thread
-	static void awake(cpu_thread&, u32 prio);
+	static void awake_unlocked(cpu_thread&, u32 prio);
+
+	static void awake(cpu_thread& thread, u32 prio)
+	{
+		std::lock_guard lock(g_mutex);
+
+		awake_unlocked(thread, prio);
+	}
+
+	static void append(cpu_thread& thread)
+	{
+		awake_unlocked(thread, -3);
+	}
 
 	static void awake(cpu_thread& thread)
 	{
 		awake(thread, -1);
 	}
+
+	static void schedule_all();
 
 	static void cleanup();
 
@@ -213,10 +230,10 @@ struct lv2_obj
 		}
 	}
 
-private:
 	// Scheduler mutex
 	static shared_mutex g_mutex;
 
+private:
 	// Scheduler queue for active PPU threads
 	static std::deque<class ppu_thread*> g_ppu;
 
@@ -225,6 +242,4 @@ private:
 
 	// Scheduler queue for timeouts (wait until -> thread)
 	static std::deque<std::pair<u64, class cpu_thread*>> g_waiting;
-
-	static void schedule_all();
 };

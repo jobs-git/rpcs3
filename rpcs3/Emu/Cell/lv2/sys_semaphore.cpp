@@ -1,4 +1,4 @@
-#include "stdafx.h"
+﻿#include "stdafx.h"
 #include "Emu/Memory/vm.h"
 #include "Emu/System.h"
 #include "Emu/IdManager.h"
@@ -237,11 +237,15 @@ error_code sys_semaphore_post(ppu_thread& ppu, u32 sem_id, s32 count)
 			return not_an_error(CELL_EBUSY);
 		}
 
+		std::lock_guard tlock(lv2_obj::g_mutex);
+
 		// Wake threads
 		for (s32 i = std::min<s32>(-std::min<s32>(val, 0), count); i > 0; i--)
 		{
-			sem->awake(*verify(HERE, sem->schedule<ppu_thread>(sem->sq, sem->protocol)));
+			sem->append(*verify(HERE, sem->schedule<ppu_thread>(sem->sq, sem->protocol)));
 		}
+
+		lv2_obj::schedule_all();
 	}
 
 	return CELL_OK;

@@ -226,22 +226,27 @@ error_code sys_cond_wait(ppu_thread& ppu, u32 cond_id, u64 timeout)
 	}
 	else
 	{
+		// Further function result
+		ppu.gpr[3] = CELL_OK;
+
+		vm::temporary_unlock(ppu);
+
 		std::lock_guard lock(cond->mutex->mutex);
 
 		// Register waiter
 		cond->sq.emplace_back(&ppu);
-		cond->sleep(ppu, timeout);
 
 		// Unlock the mutex
 		cond->mutex->lock_count = 0;
 
+		std::lock_guard tlock(lv2_obj::g_mutex);
+
 		if (auto cpu = cond->mutex->reown<ppu_thread>())
 		{
-			cond->mutex->awake(*cpu);
+			cond->mutex->append(*cpu);
 		}
 
-		// Further function result
-		ppu.gpr[3] = CELL_OK;
+		cond->sleep_unlocked(ppu, timeout);
 	}
 
 	while (!ppu.state.test_and_reset(cpu_flag::signal))

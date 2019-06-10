@@ -1003,10 +1003,8 @@ DECLARE(lv2_obj::g_ppu);
 DECLARE(lv2_obj::g_pending);
 DECLARE(lv2_obj::g_waiting);
 
-void lv2_obj::sleep_timeout(cpu_thread& thread, u64 timeout)
+void lv2_obj::sleep_unlocked(cpu_thread& thread, u64 timeout)
 {
-	std::lock_guard lock(g_mutex);
-
 	const u64 start_time = get_system_time();
 
 	if (auto ppu = static_cast<ppu_thread*>(thread.id_type() == 1 ? &thread : nullptr))
@@ -1057,12 +1055,10 @@ void lv2_obj::sleep_timeout(cpu_thread& thread, u64 timeout)
 	schedule_all();
 }
 
-void lv2_obj::awake(cpu_thread& cpu, u32 prio)
+void lv2_obj::awake_unlocked(cpu_thread& cpu, u32 prio)
 {
 	// Check thread type
 	if (cpu.id_type() != 1) return;
-
-	std::lock_guard lock(g_mutex);
 
 	if (prio < INT32_MAX)
 	{
@@ -1143,7 +1139,10 @@ void lv2_obj::awake(cpu_thread& cpu, u32 prio)
 		}
 	}
 
-	schedule_all();
+	if (prio != -3)
+	{
+		schedule_all();
+	}
 }
 
 void lv2_obj::cleanup()
