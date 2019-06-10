@@ -2,6 +2,7 @@
 
 #include "types.h"
 #include <functional>
+#include <atomic>
 
 // Helper class, provides access to compiler-specific atomic intrinsics
 template <typename T, std::size_t Size = sizeof(T)>
@@ -822,6 +823,27 @@ public:
 				{
 					return result;
 				}
+			}
+		}
+	}
+
+	template <typename F>
+	bool cond_op(F&& func)
+	{
+		type _new, old = atomic_storage<type>::load(m_data);
+
+		while (true)
+		{
+			_new = old;
+
+			if (!std::invoke(std::forward<F>(func), _new))
+			{
+				return false;
+			}
+
+			if (LIKELY(atomic_storage<type>::compare_exchange(m_data, old, _new)))
+			{
+				return true;
 			}
 		}
 	}

@@ -182,8 +182,6 @@ error_code sys_rsx_context_iomap(u32 context_id, u32 io, u32 ea, u32 size, u64 f
 		return CELL_EINVAL;
 	}
 
-	vm::reader_lock rlock;
-
 	for (u32 addr = ea, end = ea + size; addr < end; addr += 0x100000)
 	{
 		if (!vm::check_addr(addr, 1, vm::page_allocated | vm::page_1m_size))
@@ -200,6 +198,7 @@ error_code sys_rsx_context_iomap(u32 context_id, u32 io, u32 ea, u32 size, u64 f
 		RSXIOMem.ea[io + i].release(ea + i);
 	}
 
+	_mm_sfence();
 	return CELL_OK;
 }
 
@@ -225,6 +224,7 @@ error_code sys_rsx_context_iounmap(u32 context_id, u32 io, u32 size)
 		RSXIOMem.ea[io++].release(0xFFFF);
 	}
 
+	_mm_sfence();
 	return CELL_OK;
 }
 
